@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.agent_id
+*.db
+*.db-shm
+*.db-wal
+workspace/
+
