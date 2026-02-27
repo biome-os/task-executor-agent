@@ -189,6 +189,7 @@ class OrchestratorClient:
         self._shutting_down: bool = False
         self._current_ws: Any = None
         self._pending_responses: dict[str, asyncio.Future] = {}
+        self._running_workflows: dict[str, asyncio.Task] = {}
 
         self._store = WorkflowStore()
 
@@ -235,6 +236,9 @@ class OrchestratorClient:
                         await self._register()
                     except Exception as reg_exc:
                         logger.error("Re-registration failed: %s", reg_exc)
+                elif code == 4003:
+                    logger.info("Agent is disabled by orchestrator (4003) — will retry so dashboard enable can restore connection")
+                    backoff = max(backoff, 10.0)
                 elif self._shutting_down:
                     break
                 else:
@@ -321,6 +325,15 @@ class OrchestratorClient:
                     fut.set_exception(RuntimeError(
                         f"[{payload.get('code')}] {payload.get('detail')}"
                     ))
+
+        elif mtype == "task_cancel":
+            task_id = payload.get("task_id", "")
+            task = self._running_workflows.get(task_id)
+            if task and not task.done():
+                task.cancel()
+                logger.info("Cancel requested for workflow %s", task_id)
+            else:
+                logger.warning("Cancel request for workflow %s — not running", task_id)
 
         elif mtype == "agent_registered":
             logger.info("Peer joined: %s", payload.get("agent_id"))
@@ -413,10 +426,11 @@ class OrchestratorClient:
         await asyncio.to_thread(self._store.create_workflow, plan)
 
         # Start execution in background so we can respond to the planner quickly
-        asyncio.create_task(
+        exec_task = asyncio.create_task(
             self._execute_workflow(task_id, steps, ws, plan=plan),
             name=f"exec-{task_id[:8]}",
         )
+        self._running_workflows[task_id] = exec_task
 
         logger.info(
             "Workflow %s accepted for execution (%d steps)", task_id, len(steps)
@@ -484,105 +498,159 @@ class OrchestratorClient:
 
         logger.info("Starting execution of workflow %s (%d steps)", task_id, total)
 
-        await asyncio.to_thread(
-            self._store.update_workflow_status, task_id, WorkflowStatus.executing
-        )
-
-        # Emit workflow_started — include title/description/goal for the dashboard tracker
-        await self._emit_workflow_event(ws, {
-            "event":          "workflow_started",
-            "task_id":        task_id,
-            "title":          (plan or {}).get("title", ""),
-            "description":    (plan or {}).get("description", ""),
-            "goal":           (plan or {}).get("goal", ""),
-            "total_steps":    total,
-            "workflow_status": WorkflowStatus.executing.value,
-        })
-
-        for step in steps:
-            step_id    = step["step_id"]
-            step_order = step["order"]
-            step_name  = step["name"]
-            step_desc  = step.get("description", "")
-            capability = step["capability"]
-            # Resolve any {{steps[N].output.field}} references from previous step outputs
-            input_data = self._resolve_step_refs(step.get("input_data", {}), step_outputs)
-
-            logger.info(
-                "Workflow %s — step %d/%d: %r (capability=%s)",
-                task_id, step_order, total, step_name, capability,
-            )
-
-            # Mark step as running
+        try:
             await asyncio.to_thread(
-                self._store.update_step_status, step_id, StepStatus.running
+                self._store.update_workflow_status, task_id, WorkflowStatus.executing
             )
 
-            # Emit step_started
+            # Emit workflow_started — include title/description/goal for the dashboard tracker
             await self._emit_workflow_event(ws, {
-                "event":          "step_started",
+                "event":          "workflow_started",
                 "task_id":        task_id,
-                "step_id":        step_id,
-                "step_order":     step_order,
-                "step_name":      step_name,
-                "step_desc":      step_desc,
-                "capability":     capability,
+                "title":          (plan or {}).get("title", ""),
+                "description":    (plan or {}).get("description", ""),
+                "goal":           (plan or {}).get("goal", ""),
                 "total_steps":    total,
                 "workflow_status": WorkflowStatus.executing.value,
             })
 
-            t0 = time.monotonic()
-            try:
-                target_agent_id = step.get("target_agent_id")
-                success, output, error = await self._dispatch_step(
-                    capability=capability,
-                    input_data=input_data,
-                    target_agent_id=target_agent_id,
-                    ws=ws,
+            for step in steps:
+                step_id    = step["step_id"]
+                step_order = step["order"]
+                step_name  = step["name"]
+                step_desc  = step.get("description", "")
+                capability = step["capability"]
+                # Resolve any {{steps[N].output.field}} references from previous step outputs
+                input_data = self._resolve_step_refs(step.get("input_data", {}), step_outputs)
+
+                logger.info(
+                    "Workflow %s — step %d/%d: %r (capability=%s)",
+                    task_id, step_order, total, step_name, capability,
                 )
-                duration_ms = (time.monotonic() - t0) * 1000
 
-                if success:
-                    completed += 1
-                    step_outputs.append(output)  # Record for subsequent step references
-                    await asyncio.to_thread(
-                        self._store.update_step_status,
-                        step_id,
-                        StepStatus.completed,
-                        output_data=output,
-                        duration_ms=round(duration_ms, 1),
-                    )
-                    logger.info(
-                        "Workflow %s — step %d completed (%.0f ms)",
-                        task_id, step_order, duration_ms,
-                    )
-                    await self._emit_workflow_event(ws, {
-                        "event":          "step_completed",
-                        "task_id":        task_id,
-                        "step_id":        step_id,
-                        "step_order":     step_order,
-                        "step_name":      step_name,
-                        "capability":     capability,
-                        "output_data":    output,
-                        "duration_ms":    round(duration_ms, 1),
-                        "steps_completed": completed,
-                        "total_steps":    total,
-                        "workflow_status": WorkflowStatus.executing.value,
-                    })
+                # Mark step as running
+                await asyncio.to_thread(
+                    self._store.update_step_status, step_id, StepStatus.running
+                )
 
-                else:
+                # Emit step_started — include input_data so dashboard can show the payload
+                await self._emit_workflow_event(ws, {
+                    "event":          "step_started",
+                    "task_id":        task_id,
+                    "step_id":        step_id,
+                    "step_order":     step_order,
+                    "step_name":      step_name,
+                    "description":    step_desc,
+                    "capability":     capability,
+                    "input_data":     input_data,
+                    "total_steps":    total,
+                    "workflow_status": WorkflowStatus.executing.value,
+                })
+
+                t0 = time.monotonic()
+                agent_id = None
+                try:
+                    target_agent_id = step.get("target_agent_id")
+                    success, output, error, agent_id = await self._dispatch_step(
+                        capability=capability,
+                        input_data=input_data,
+                        target_agent_id=target_agent_id,
+                        ws=ws,
+                    )
+                    duration_ms = (time.monotonic() - t0) * 1000
+
+                    if success:
+                        completed += 1
+                        step_outputs.append(output)  # Record for subsequent step references
+                        await asyncio.to_thread(
+                            self._store.update_step_status,
+                            step_id,
+                            StepStatus.completed,
+                            output_data=output,
+                            duration_ms=round(duration_ms, 1),
+                        )
+                        logger.info(
+                            "Workflow %s — step %d completed (%.0f ms)",
+                            task_id, step_order, duration_ms,
+                        )
+                        await self._emit_workflow_event(ws, {
+                            "event":          "step_completed",
+                            "task_id":        task_id,
+                            "step_id":        step_id,
+                            "step_order":     step_order,
+                            "step_name":      step_name,
+                            "capability":     capability,
+                            "output_data":    output,
+                            "agent_id":       agent_id,
+                            "duration_ms":    round(duration_ms, 1),
+                            "steps_completed": completed,
+                            "total_steps":    total,
+                            "workflow_status": WorkflowStatus.executing.value,
+                        })
+
+                    else:
+                        failed += 1
+                        step_outputs.append(None)  # Preserve index alignment
+                        await asyncio.to_thread(
+                            self._store.update_step_status,
+                            step_id,
+                            StepStatus.failed,
+                            error=error,
+                            duration_ms=round(duration_ms, 1),
+                        )
+                        logger.warning(
+                            "Workflow %s — step %d failed: %s", task_id, step_order, error
+                        )
+                        await self._emit_workflow_event(ws, {
+                            "event":          "step_failed",
+                            "task_id":        task_id,
+                            "step_id":        step_id,
+                            "step_order":     step_order,
+                            "step_name":      step_name,
+                            "capability":     capability,
+                            "error":          error,
+                            "agent_id":       agent_id,
+                            "duration_ms":    round(duration_ms, 1),
+                            "steps_failed":   failed,
+                            "total_steps":    total,
+                            "workflow_status": WorkflowStatus.executing.value,
+                        })
+                        # Mark remaining steps as skipped and abort workflow
+                        remaining = steps[step_order:]  # steps after the failed one
+                        for rem in remaining:
+                            await asyncio.to_thread(
+                                self._store.update_step_status, rem["step_id"], StepStatus.skipped
+                            )
+                        await asyncio.to_thread(
+                            self._store.update_workflow_status,
+                            task_id,
+                            WorkflowStatus.failed,
+                            error=f"Step {step_order} '{step_name}' failed: {error}",
+                        )
+                        await self._emit_workflow_event(ws, {
+                            "event":             "workflow_failed",
+                            "task_id":           task_id,
+                            "steps_completed":   completed,
+                            "steps_failed":      failed,
+                            "total_steps":       total,
+                            "error":             f"Step {step_order} failed: {error}",
+                            "workflow_status":   WorkflowStatus.failed.value,
+                        })
+                        return
+
+                except Exception as exc:
+                    duration_ms = (time.monotonic() - t0) * 1000
                     failed += 1
                     step_outputs.append(None)  # Preserve index alignment
+                    err_msg = str(exc)
                     await asyncio.to_thread(
                         self._store.update_step_status,
                         step_id,
                         StepStatus.failed,
-                        error=error,
+                        error=err_msg,
                         duration_ms=round(duration_ms, 1),
                     )
-                    logger.warning(
-                        "Workflow %s — step %d failed: %s", task_id, step_order, error
-                    )
+                    logger.exception("Workflow %s — step %d raised exception", task_id, step_order)
                     await self._emit_workflow_event(ws, {
                         "event":          "step_failed",
                         "task_id":        task_id,
@@ -590,91 +658,65 @@ class OrchestratorClient:
                         "step_order":     step_order,
                         "step_name":      step_name,
                         "capability":     capability,
-                        "error":          error,
+                        "error":          err_msg,
+                        "agent_id":       agent_id,
                         "duration_ms":    round(duration_ms, 1),
-                        "steps_failed":   failed,
-                        "total_steps":    total,
                         "workflow_status": WorkflowStatus.executing.value,
                     })
-                    # Mark remaining steps as skipped and abort workflow
-                    remaining = steps[step_order:]  # steps after the failed one
-                    for rem in remaining:
-                        await asyncio.to_thread(
-                            self._store.update_step_status, rem["step_id"], StepStatus.skipped
-                        )
                     await asyncio.to_thread(
                         self._store.update_workflow_status,
                         task_id,
                         WorkflowStatus.failed,
-                        error=f"Step {step_order} '{step_name}' failed: {error}",
+                        error=f"Step {step_order} raised: {err_msg}",
                     )
                     await self._emit_workflow_event(ws, {
-                        "event":             "workflow_failed",
-                        "task_id":           task_id,
-                        "steps_completed":   completed,
-                        "steps_failed":      failed,
-                        "total_steps":       total,
-                        "error":             f"Step {step_order} failed: {error}",
-                        "workflow_status":   WorkflowStatus.failed.value,
+                        "event":           "workflow_failed",
+                        "task_id":         task_id,
+                        "steps_completed": completed,
+                        "steps_failed":    failed,
+                        "total_steps":     total,
+                        "error":           err_msg,
+                        "workflow_status": WorkflowStatus.failed.value,
                     })
                     return
 
-            except Exception as exc:
-                duration_ms = (time.monotonic() - t0) * 1000
-                failed += 1
-                step_outputs.append(None)  # Preserve index alignment
-                err_msg = str(exc)
-                await asyncio.to_thread(
-                    self._store.update_step_status,
-                    step_id,
-                    StepStatus.failed,
-                    error=err_msg,
-                    duration_ms=round(duration_ms, 1),
-                )
-                logger.exception("Workflow %s — step %d raised exception", task_id, step_order)
-                await self._emit_workflow_event(ws, {
-                    "event":          "step_failed",
-                    "task_id":        task_id,
-                    "step_id":        step_id,
-                    "step_order":     step_order,
-                    "step_name":      step_name,
-                    "capability":     capability,
-                    "error":          err_msg,
-                    "duration_ms":    round(duration_ms, 1),
-                    "workflow_status": WorkflowStatus.executing.value,
-                })
-                await asyncio.to_thread(
-                    self._store.update_workflow_status,
-                    task_id,
-                    WorkflowStatus.failed,
-                    error=f"Step {step_order} raised: {err_msg}",
-                )
-                await self._emit_workflow_event(ws, {
-                    "event":           "workflow_failed",
-                    "task_id":         task_id,
-                    "steps_completed": completed,
-                    "steps_failed":    failed,
-                    "total_steps":     total,
-                    "error":           err_msg,
-                    "workflow_status": WorkflowStatus.failed.value,
-                })
-                return
+            # All steps completed successfully
+            await asyncio.to_thread(
+                self._store.update_workflow_status, task_id, WorkflowStatus.completed
+            )
+            logger.info(
+                "Workflow %s completed: %d/%d steps succeeded", task_id, completed, total
+            )
+            await self._emit_workflow_event(ws, {
+                "event":           "workflow_completed",
+                "task_id":         task_id,
+                "steps_completed": completed,
+                "steps_failed":    failed,
+                "total_steps":     total,
+                "workflow_status": WorkflowStatus.completed.value,
+            })
 
-        # All steps completed successfully
-        await asyncio.to_thread(
-            self._store.update_workflow_status, task_id, WorkflowStatus.completed
-        )
-        logger.info(
-            "Workflow %s completed: %d/%d steps succeeded", task_id, completed, total
-        )
-        await self._emit_workflow_event(ws, {
-            "event":           "workflow_completed",
-            "task_id":         task_id,
-            "steps_completed": completed,
-            "steps_failed":    failed,
-            "total_steps":     total,
-            "workflow_status": WorkflowStatus.completed.value,
-        })
+        except asyncio.CancelledError:
+            logger.info("Workflow %s cancelled", task_id)
+            await asyncio.to_thread(
+                self._store.update_workflow_status,
+                task_id,
+                WorkflowStatus.cancelled,
+                error="Cancelled by user",
+            )
+            await self._emit_workflow_event(ws, {
+                "event":           "workflow_cancelled",
+                "task_id":         task_id,
+                "steps_completed": completed,
+                "steps_failed":    failed,
+                "total_steps":     total,
+                "error":           "Cancelled by user",
+                "workflow_status": WorkflowStatus.cancelled.value,
+            })
+            # Don't re-raise — the task finishes cleanly after emitting the event
+
+        finally:
+            self._running_workflows.pop(task_id, None)
 
     # ── Step dispatch ──────────────────────────────────────────────────────
 
@@ -684,17 +726,20 @@ class OrchestratorClient:
         input_data: dict,
         target_agent_id: Optional[str],
         ws,
-    ) -> tuple[bool, Optional[dict], Optional[str]]:
-        """Discover best agent for *capability* and send a task_request."""
+    ) -> tuple[bool, Optional[dict], Optional[str], Optional[str]]:
+        """Discover best agent for *capability* and send a task_request.
+
+        Returns (success, output, error, resolved_agent_id).
+        """
         ws_ref = self._current_ws
         if ws_ref is None:
-            return False, None, "No active WebSocket connection"
+            return False, None, "No active WebSocket connection", None
 
         # Resolve agent
         if not target_agent_id:
             target_agent_id = await self._discover_best(capability)
             if not target_agent_id:
-                return False, None, f"No available agent for capability '{capability}'"
+                return False, None, f"No available agent for capability '{capability}'", None
 
         req_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
@@ -718,13 +763,13 @@ class OrchestratorClient:
                 asyncio.shield(fut), timeout=STEP_DISPATCH_TIMEOUT_S
             )
             if resp_payload.get("success"):
-                return True, resp_payload.get("output_data"), None
-            return False, None, resp_payload.get("error", "Unknown error from agent")
+                return True, resp_payload.get("output_data"), None, target_agent_id
+            return False, None, resp_payload.get("error", "Unknown error from agent"), target_agent_id
 
         except asyncio.TimeoutError:
-            return False, None, f"Step timed out after {STEP_DISPATCH_TIMEOUT_S:.0f}s"
+            return False, None, f"Step timed out after {STEP_DISPATCH_TIMEOUT_S:.0f}s", target_agent_id
         except Exception as exc:
-            return False, None, str(exc)
+            return False, None, str(exc), target_agent_id
         finally:
             self._pending_responses.pop(req_id, None)
 

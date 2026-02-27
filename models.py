@@ -19,7 +19,8 @@ class WorkflowStatus(str, Enum):
     executing = "executing"
     completed = "completed"
     failed    = "failed"
+    cancelled = "cancelled"
 
 
 TERMINAL_STEP_STATUSES    = {StepStatus.completed, StepStatus.failed, StepStatus.skipped}
-TERMINAL_WORKFLOW_STATUSES = {WorkflowStatus.completed, WorkflowStatus.failed}
+TERMINAL_WORKFLOW_STATUSES = {WorkflowStatus.completed, WorkflowStatus.failed, WorkflowStatus.cancelled}
