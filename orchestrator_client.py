@@ -85,6 +85,7 @@ REGISTRATION_PAYLOAD: dict = {
                 },
             },
             "tags": ["executor", "workflow", "orchestration"],
+            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "Coordination only"},
         },
         {
             "name": "get_workflow_status",
@@ -103,6 +104,7 @@ REGISTRATION_PAYLOAD: dict = {
                 },
             },
             "tags": ["executor", "workflow"],
+            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "SQLite read"},
         },
         {
             "name": "list_workflows",
@@ -121,6 +123,7 @@ REGISTRATION_PAYLOAD: dict = {
                 },
             },
             "tags": ["executor", "workflow"],
+            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "SQLite read"},
         },
     ],
     "tags": ["executor", "workflow", "orchestration"],

@@ -9,11 +9,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 
 from orchestrator_client import OrchestratorClient
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.getLevelName(os.environ.get("LOG_LEVEL", "INFO").upper()),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
