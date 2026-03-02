@@ -59,78 +59,22 @@ REGISTRATION_PAYLOAD: dict = {
     "capabilities": [
         {
             "name": "execute_workflow",
-            "description": (
-                "Execute a structured workflow plan produced by the task-planner-agent. "
-                "Steps are dispatched sequentially to appropriate agents; status is "
-                "tracked in SQLite and reported in real-time via workflow_event messages."
-            ),
+            "description": "Execute a structured workflow plan from the task-planner-agent.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "plan": {
                         "type": "object",
-                        "description": "WorkflowPlan dict as produced by the task-planner-agent.",
+                        "description": "WorkflowPlan dict produced by task-planner-agent.",
                     }
                 },
                 "required": ["plan"],
             },
-            "output_schema": {
-                "type": "object",
-                "properties": {
-                    "task_id":        {"type": "string"},
-                    "status":         {"type": "string"},
-                    "steps_completed": {"type": "integer"},
-                    "steps_failed":   {"type": "integer"},
-                    "steps_total":    {"type": "integer"},
-                },
-            },
             "tags": ["executor", "workflow", "orchestration"],
-            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "Coordination only"},
-        },
-        {
-            "name": "get_workflow_status",
-            "description": "Retrieve the current status of a workflow by its task_id.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "UUID of the workflow."},
-                },
-                "required": ["task_id"],
-            },
-            "output_schema": {
-                "type": "object",
-                "properties": {
-                    "workflow": {"type": "object"},
-                },
-            },
-            "tags": ["executor", "workflow"],
-            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "SQLite read"},
-        },
-        {
-            "name": "list_workflows",
-            "description": "List recent workflows with their statuses.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "Max results (default 20)."},
-                },
-            },
-            "output_schema": {
-                "type": "object",
-                "properties": {
-                    "workflows": {"type": "array"},
-                    "count":     {"type": "integer"},
-                },
-            },
-            "tags": ["executor", "workflow"],
-            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "SQLite read"},
+            "cost": {"type": "free", "estimated_cost_usd": None},
         },
     ],
     "tags": ["executor", "workflow", "orchestration"],
-    "metadata": {
-        "language": "python",
-        "persistence": "sqlite",
-    },
     "required_settings": [],
 }
 
