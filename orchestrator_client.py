@@ -496,9 +496,10 @@ class OrchestratorClient:
 
                 t0 = time.monotonic()
                 agent_id = None
+                agent_name = None
                 try:
                     target_agent_id = step.get("target_agent_id")
-                    success, output, error, agent_id = await self._dispatch_step(
+                    success, output, error, agent_id, agent_name = await self._dispatch_step(
                         capability=capability,
                         input_data=input_data,
                         target_agent_id=target_agent_id,
@@ -529,6 +530,7 @@ class OrchestratorClient:
                             "capability":     capability,
                             "output_data":    output,
                             "agent_id":       agent_id,
+                            "agent_name":     agent_name,
                             "duration_ms":    round(duration_ms, 1),
                             "steps_completed": completed,
                             "total_steps":    total,
@@ -557,6 +559,7 @@ class OrchestratorClient:
                             "capability":     capability,
                             "error":          error,
                             "agent_id":       agent_id,
+                            "agent_name":     agent_name,
                             "duration_ms":    round(duration_ms, 1),
                             "steps_failed":   failed,
                             "total_steps":    total,
@@ -607,6 +610,7 @@ class OrchestratorClient:
                         "capability":     capability,
                         "error":          err_msg,
                         "agent_id":       agent_id,
+                        "agent_name":     agent_name,
                         "duration_ms":    round(duration_ms, 1),
                         "workflow_status": WorkflowStatus.executing.value,
                     })
@@ -673,20 +677,21 @@ class OrchestratorClient:
         input_data: dict,
         target_agent_id: Optional[str],
         ws,
-    ) -> tuple[bool, Optional[dict], Optional[str], Optional[str]]:
+    ) -> tuple[bool, Optional[dict], Optional[str], Optional[str], Optional[str]]:
         """Discover best agent for *capability* and send a task_request.
 
-        Returns (success, output, error, resolved_agent_id).
+        Returns (success, output, error, resolved_agent_id, resolved_agent_name).
         """
         ws_ref = self._current_ws
         if ws_ref is None:
-            return False, None, "No active WebSocket connection", None
+            return False, None, "No active WebSocket connection", None, None
 
         # Resolve agent
+        agent_name: Optional[str] = None
         if not target_agent_id:
-            target_agent_id = await self._discover_best(capability)
+            target_agent_id, agent_name = await self._discover_best(capability)
             if not target_agent_id:
-                return False, None, f"No available agent for capability '{capability}'", None
+                return False, None, f"No available agent for capability '{capability}'", None, None
 
         req_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
@@ -710,17 +715,18 @@ class OrchestratorClient:
                 asyncio.shield(fut), timeout=STEP_DISPATCH_TIMEOUT_S
             )
             if resp_payload.get("success"):
-                return True, resp_payload.get("output_data"), None, target_agent_id
-            return False, None, resp_payload.get("error", "Unknown error from agent"), target_agent_id
+                return True, resp_payload.get("output_data"), None, target_agent_id, agent_name
+            return False, None, resp_payload.get("error", "Unknown error from agent"), target_agent_id, agent_name
 
         except asyncio.TimeoutError:
-            return False, None, f"Step timed out after {STEP_DISPATCH_TIMEOUT_S:.0f}s", target_agent_id
+            return False, None, f"Step timed out after {STEP_DISPATCH_TIMEOUT_S:.0f}s", target_agent_id, agent_name
         except Exception as exc:
-            return False, None, str(exc), target_agent_id
+            return False, None, str(exc), target_agent_id, agent_name
         finally:
             self._pending_responses.pop(req_id, None)
 
-    async def _discover_best(self, capability: str) -> Optional[str]:
+    async def _discover_best(self, capability: str) -> tuple[Optional[str], Optional[str]]:
+        """Return (agent_id, agent_name) for the best available agent."""
         try:
             resp = await self._http.get(
                 f"{self._base}/api/v1/discover/best",
@@ -729,14 +735,15 @@ class OrchestratorClient:
             if resp.status_code == 200:
                 data = resp.json()
                 agent_id = data.get("agent_id")
+                agent_name = data.get("name")
                 logger.info(
-                    "Discovered agent %s for capability '%s'", agent_id, capability
+                    "Discovered agent %s (%s) for capability '%s'", agent_id, agent_name, capability
                 )
-                return agent_id
+                return agent_id, agent_name
             logger.warning("No agent for capability '%s' (status=%d)", capability, resp.status_code)
         except Exception as exc:
             logger.error("Discovery failed: %s", exc)
-        return None
+        return None, None
 
     # ── Workflow event emission ────────────────────────────────────────────
 
@@ -816,6 +823,8 @@ class OrchestratorClient:
         log("→ [%s] to=%s", mtype, msg.get("recipient_id") or "orchestrator")
         try:
             await ws.send(msg_str)
+        except websockets.exceptions.ConnectionClosed:
+            raise  # propagate → heartbeat loop exits → asyncio.gather raises → reconnect
         except Exception as exc:
             logger.warning("WS send failed: %s", exc)
 
