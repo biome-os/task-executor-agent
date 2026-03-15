@@ -461,6 +461,18 @@ class OrchestratorClient:
                 "workflow_status": WorkflowStatus.executing.value,
             })
 
+            # Build reply context from plan metadata (passed through from planner)
+            _plan_meta = plan or {}
+            _reply_ctx: dict | None = None
+            _plan_channel = (_plan_meta.get("channel_id") or "").strip()
+            if _plan_channel or (_plan_meta.get("user_id") or "").strip():
+                _reply_ctx = {
+                    "channel_type": (_plan_meta.get("source") or "slack").strip(),
+                    "channel_id":   _plan_channel,
+                    "thread_id":    (_plan_meta.get("thread_id") or "").strip(),
+                    "user_id":      (_plan_meta.get("user_id") or "").strip(),
+                }
+
             for step in steps:
                 step_id    = step["step_id"]
                 step_order = step["order"]
@@ -469,6 +481,9 @@ class OrchestratorClient:
                 capability = step["capability"]
                 # Resolve any {{steps[N].output.field}} references from previous step outputs
                 input_data = self._resolve_step_refs(step.get("input_data", {}), step_outputs)
+                # Forward reply context so individual agents can send user notifications
+                if _reply_ctx and isinstance(input_data, dict):
+                    input_data["_reply_context"] = _reply_ctx
 
                 logger.info(
                     "Workflow %s — step %d/%d: %r (capability=%s)",
@@ -788,6 +803,21 @@ class OrchestratorClient:
                 "metrics":      self._metrics(),
             },
         ))
+
+    # ── User notification helper ───────────────────────────────────────────
+
+    async def _notify_user(self, reply_context: dict, message: str) -> None:
+        """Send a status message back to the originating user channel."""
+        if not reply_context or not message:
+            return
+        try:
+            await self._http.post(
+                f"{self._base}/api/v1/notify",
+                json={**reply_context, "message": message, "sender_agent_id": self._agent_id},
+                timeout=10.0,
+            )
+        except Exception as exc:
+            logger.warning("_notify_user failed: %s", exc)
 
     # ── Graceful shutdown ──────────────────────────────────────────────────
 
