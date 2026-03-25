@@ -15,6 +15,7 @@ import signal
 import time
 import uuid
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -84,6 +85,7 @@ HEARTBEAT_INTERVAL_S: int = 15
 MAX_BACKOFF_S: int = 60
 DRAIN_TIMEOUT_S: int = 120
 STEP_DISPATCH_TIMEOUT_S: float = 300.0
+LOG_MESSAGE_BODIES: bool = os.getenv("LOG_MESSAGE_BODIES", "false").lower() in ("1", "true", "yes")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -242,7 +244,10 @@ class OrchestratorClient:
                 continue
 
             mtype = msg.get("type", "?")
-            logger.info("← [%s] from=%s", mtype, msg.get("sender_id", "?"))
+            if LOG_MESSAGE_BODIES:
+                logger.info("← [%s] from=%s msg=%s", mtype, msg.get("sender_id", "?"), msg)
+            else:
+                logger.info("← [%s] from=%s", mtype, msg.get("sender_id", "?"))
             await self._dispatch(ws, msg)
 
     async def _dispatch(self, ws, msg: dict) -> None:
@@ -395,32 +400,60 @@ class OrchestratorClient:
         in *input_data* with values from *step_outputs* (0-indexed list of dicts).
         Works for strings, dicts, and lists; leaves other types unchanged.
         """
-        _REF_RE = re.compile(r"\{\{steps\[(\d+)\]\.output\.([^}]+)\}\}")
+        _REF_RE = re.compile(r"\{\{steps\[(\d+)\]\.output(?:\.([^}]+))?\}\}")
+        # Fallback key aliases tried in order when the exact key is missing.
+        # e.g. {{steps[N].output.text}} resolves to `summary` if `text` is absent.
+        _KEY_FALLBACKS: dict[str, tuple[str, ...]] = {
+            "text":    ("summary", "content", "result", "response", "output", "answer", "body"),
+            "summary": ("text", "content", "result", "response"),
+            "content": ("text", "summary", "result", "response"),
+            "result":  ("text", "summary", "content", "response", "output"),
+        }
+
+        def _get_with_fallback(d: dict, key: str) -> Any:
+            """Look up *key* in *d*; if missing, try known aliases before returning None."""
+            val = d.get(key)
+            if val is not None:
+                return val
+            for alt in _KEY_FALLBACKS.get(key, ()):
+                val = d.get(alt)
+                if val is not None:
+                    logger.debug("Template key %r not found; resolved via alias %r", key, alt)
+                    return val
+            return None
+
+        def _walk_path(root: Any, path: list[str]) -> Any:
+            out = root
+            for i, key in enumerate(path):
+                if not isinstance(out, dict):
+                    return None
+                if i == len(path) - 1:
+                    out = _get_with_fallback(out, key)
+                else:
+                    out = out.get(key)
+            return out
 
         def _resolve_str(s: str) -> Any:
             """If *s* is a single reference, return the resolved value directly
             (preserving non-string types); otherwise do string substitution."""
             full_match = _REF_RE.fullmatch(s)
             if full_match:
-                idx, path = int(full_match.group(1)), full_match.group(2).split(".")
-                out = (step_outputs[idx] or {}) if idx < len(step_outputs) else {}
-                for key in path:
-                    if isinstance(out, dict):
-                        out = out.get(key)
-                    else:
-                        out = None
-                        break
-                return out
+                idx = int(full_match.group(1))
+                path_group = full_match.group(2)
+                root = (step_outputs[idx] or {}) if idx < len(step_outputs) else {}
+                if not path_group:
+                    return root
+                path = path_group.split(".")
+                return _walk_path(root, path)
             # Partial substitution — always returns a string
             def _sub(m: re.Match) -> str:
-                idx, path = int(m.group(1)), m.group(2).split(".")
-                out: Any = (step_outputs[idx] or {}) if idx < len(step_outputs) else {}
-                for key in path:
-                    if isinstance(out, dict):
-                        out = out.get(key)
-                    else:
-                        out = None
-                        break
+                idx = int(m.group(1))
+                path_group = m.group(2)
+                root: Any = (step_outputs[idx] or {}) if idx < len(step_outputs) else {}
+                if not path_group:
+                    out = root
+                else:
+                    out = _walk_path(root, path_group.split("."))
                 return str(out) if out is not None else m.group(0)
             return _REF_RE.sub(_sub, s)
 
@@ -850,7 +883,10 @@ class OrchestratorClient:
         mtype = msg.get("type", "?")
         noisy = mtype in ("heartbeat", "status_update")
         log   = logger.debug if noisy else logger.info
-        log("→ [%s] to=%s", mtype, msg.get("recipient_id") or "orchestrator")
+        if LOG_MESSAGE_BODIES and not noisy:
+            log("→ [%s] to=%s msg=%s", mtype, msg.get("recipient_id") or "orchestrator", msg)
+        else:
+            log("→ [%s] to=%s", mtype, msg.get("recipient_id") or "orchestrator")
         try:
             await ws.send(msg_str)
         except websockets.exceptions.ConnectionClosed:
